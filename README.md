@@ -1,4 +1,4 @@
-# Nova - Intelligent Invisible Desktop Assistant
+# Nova - Hybrid AI Desktop Assistant
 
 <div align="center">
   <img src="assets/banner.png" alt="Nova Banner" width="100%" style="border-radius: 10px;">
@@ -12,98 +12,88 @@
   </p>
 </div>
 
-**Nova** is a next-generation desktop assistant that reimagines how we interact with AI. Instead of a chat window that breaks your flow, Nova exists as an "invisible" layer over your desktop—always present but never intrusive. 
-
-It leverages **Cactus Compute** to run powerful AI models locally on your Mac, seamlessly handing off to the cloud only when necessary.
+**Nova** is an intelligent, privacy-preserving desktop assistant that leverages hybrid AI to enhance your workflow. By combining the speed and privacy of on-device inference (**Cactus + FunctionGemma**) with the reasoning capabilities of the cloud (**Gemini**), Nova provides real-time assistance without compromising user data.
 
 ## Features
 
-- **🧠 Hybrid Intelligence**: Automatically routes queries between **FunctionGemma** (local, fast, private) and **Gemini Flash** (cloud, reasoning-heavy) based on complexity.
-- **� Invisible Overlay**: A transparent, click-through interface built with Electron that floats above your windows.
-- **⚡️ On-Device First**: Powered by **Cactus Compute**, running Whisper (speech) and FunctionGemma (logic) locally for near-zero latency.
-- **�️ Extensible Tool Use**: Implements the **Model Context Protocol (MCP)** to connect with external apps like **Notion** and **Slack**.
-- **👁️ Multimodal**: Understands your voice via Whisper and sees your screen via Vision Language Models (VLM).
+-   **Privacy-First Analysis**: Your voice and queries are processed locally on your device by default. Sensitive information never leaves your machine unless complex reasoning is required.
+-   **Hybrid Intelligence**: Seamlessly switches between a lightweight local model (**FunctionGemma 270M**) for speed and a powerful cloud model (**Gemini 3.0 Flash**) for complex tasks.
+-   **Invisible Overlay**: A transparent, click-through interface built with Electron that floats above your windows, providing assistance without breaking your flow.
+-   **System Control**: Deep integration with your desktop to control music, set timers, and manage tools via the **Model Context Protocol (MCP)**.
+-   **Optimized for Apple Silicon**: Built on the **Cactus engine**, delivering blazing fast inference speeds on M-series chips.
 
 ## Technologies Used
 
-- **AI Engine**: [Cactus Compute](https://github.com/cactus-compute/cactus) (running `functiongemma-270m-it`, `whisper-small`, `lfm2-vl-450m`)
-- **Cloud Fallback**: [Google Gemini API](https://ai.google.dev/) (google-genai)
-- **Backend**: Python, FastAPI, Pydantic
-- **Frontend**: Electron, React, Tailwind CSS
-- **Protocols**: [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
+-   **On-Device AI**: Google FunctionGemma (270M parameters), Whisper (Small), LFM2-VL (Vision) running on Cactus.
+-   **Cloud AI**: Google Gemini 3.0 Flash for fallback reasoning.
+-   **Backend**: Python, FastAPI, Uvicorn.
+-   **Frontend**: Electron, React, Tailwind CSS.
+-   **Tooling**: cactus-python SDK, google-genai SDK, MCP (Model Context Protocol).
 
 ## Project Structure
 
 ```text
-├── app/
-│   ├── backend/           # Python Intelligence Server
-│   │   ├── notion_tools/  # Notion MCP Client
-│   │   ├── slack_tools/   # Slack MCP Client
-│   │   └── server.py      # FastAPI entry point
-│   └── frontend/          # Electron Overlay App
-│       ├── src/           # React UI components
-│       └── main.js        # Window management logic
-├── cactus/                # Cactus Engine (C++ core & bindings)
-├── src/                   # Core Hybrid Logic (The "Brain")
-│   └── main.py            # Hybrid routing algorithm
-├── scripts/               # Hackathon Utilities
-│   ├── benchmark.py       # Performance scoring
-│   └── submit.py          # Leaderboard submission
-└── docs/                  # Documentation
+├── app/                    # 📦 The Application Wrapper
+│   ├── backend/            # 🧠 The Brain (FastAPI Server)
+│   │   ├── server.py       # API Entry point
+│   │   ├── notion_tools/   # Notion MCP Client
+│   │   └── slack_tools/    # Slack MCP Client
+│   └── frontend/           # 👁️ The Eyes (Electron Overlay)
+│       ├── src/            # React UI
+│       └── main.js         # Window Management
+├── src/                    # ⚡️ The Core Logic
+│   └── main.py             # Hybrid Routing Algorithm
+├── scripts/                # 🛠️ Utilities
+│   ├── benchmark.py        # Performance Evaluation
+│   └── sync_backend.py     # Deployment Sync
+└── docs/                   # 📚 Documentation
 ```
 
-## System Architecture & Approach
+## System Architecture
 
-Nova was built with a specific philosophy: **Local for speed, Cloud for power.**
+Nova operates on a three-tier architecture designed for minimal latency and maximum privacy:
 
-### 1. The Hybrid Engine (`src/main.py`)
-At the heart of Nova is a smart router that sits between the user and the models. This was our primary focus for the hackathon challenge.
-- **Local Path**: When a user asks for a specific action ("Set a timer for 10 minutes", "Play Jazz"), Nova uses **FunctionGemma** running on **Cactus**. This ensures the request is handled instantly and privately, without leaving the device.
-- **Cloud Path**: If the request requires broad world knowledge or complex reasoning ("Summarize this article and email it to the team"), the router detects the intent and forwards it to **Gemini Flash**.
-- **Result**: We achieve the responsiveness of a native tool with the intelligence of a large language model.
+1.  **Presentation Layer**: The **Electron Frontend** provides an "invisible" overlay that captures user interactions (voice, text, screen content) and renders non-intrusive responses.
+2.  **Application Layer**: The **Python Backend** receives events, manages the application state, and orchestrates tool execution via the Model Context Protocol (MCP).
+3.  **Intelligence Layer**: The **Hybrid Router** (`src/main.py`) determines the best execution path:
+    -   **Local Path**: Uses **FunctionGemma** via Cactus for fast, private inference (typical latency: 50-100ms). Used for system controls, music, and simple queries.
+    -   **Cloud Path**: Falls back to **Gemini 3.0 Flash** when the local model's confidence is low or the task requires broad world knowledge (typical latency: 500ms+).
 
-### 2. Cactus Compute Integration
-We utilized **Cactus** to bring efficient AI inference to the desktop.
-- **LibCactus**: We use the Python bindings to load quantized models directly into memory. This avoids the overhead of running heavy local servers like Ollama.
-- **Whisper**: Integrated directly into the backend for real-time speech-to-text.
-- **VLM**: We use Cactus's vision capabilities to embed screen snapshots, giving the AI "eyes" to understand the user's context.
+## Our Approach
 
-### 3. Model Context Protocol (MCP)
-To make Nova truly useful, it needs to interact with the world. We implemented a custom MCP client that decouples the tool logic from the AI model.
-- **Dynamic Discovery**: Nova queries available tools (Notion, Slack) at runtime.
-- **Standardized Execution**: Whether the tool runs locally (e.g., system timer) or remotely (e.g., Notion API), the AI interacts with it using a unified schema.
+The core innovation in Nova is its **Hybrid Routing Strategy**. Instead of relying solely on the cloud (slow, privacy-invasive) or solely on the edge (limited reasoning), we implemented a dynamic router:
 
-## Key Lessons Learned
-
-- **Latency Matters**: For voice interfaces, even a 500ms delay feels sluggish. Running tool selection locally with FunctionGemma drastically improved the "snappiness" of the assistant compared to cloud-only solutions.
-- **Prompt Engineering for Small Models**: FunctionGemma (270M) is surprisingly capable but requires strict prompt formatting. We learned to use specific control tokens (`<start_function_declaration>`) to get reliable structured output.
-- **Electron + Python**: Packaging a full Python environment with native C++ bindings inside an Electron app is complex but necessary for a standalone distribution.
+-   **Confidence-Based Routing**: We utilize the confidence scores returned by the Cactus engine. If the local model is confident, we use its result immediately.
+-   **Latency Optimization**: By prioritizing the local model, we achieve near-instantaneous feedback for common tasks, essential for a real-time voice assistant.
+-   **Graceful Fallback**: If the local model struggles or returns a low-confidence score, the system seamlessly delegates the task to Gemini Cloud, ensuring high accuracy even for ambiguous inputs.
 
 ## Getting Started
 
 ### Prerequisites
-- **macOS** (Apple Silicon recommended)
-- **Node.js** (v16+)
-- **Python** (3.10+)
-- **Google Gemini API Key**
 
-### Quick Start
+-   **macOS** with Apple Silicon (M1/M2/M3/M4).
+-   **Python 3.10+**.
+-   **Node.js v16+**.
+-   **Google Gemini API Key**.
 
-1.  **Clone & Setup**:
+### Installation
+
+1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/cactus-compute/cactus
-    cd cactus
-    source ./setup
-    cactus build --python
+    git clone https://github.com/switchchat/desktop.git
+    cd desktop
     ```
 
-2.  **Install Dependencies**:
+2.  **Setup Cactus**:
+    Follow the [Cactus installation guide](https://github.com/cactus-compute/cactus) to build the `libcactus` bindings.
+
+3.  **Install Dependencies**:
     ```bash
     pip install google-genai requests fastapi uvicorn notion-client slack-sdk
     cd app/frontend && npm install
     ```
 
-3.  **Run Nova**:
+4.  **Run Nova**:
     *   **Backend** (Terminal 1):
         ```bash
         export GEMINI_API_KEY="your-key"
@@ -116,9 +106,12 @@ To make Nova truly useful, it needs to interact with the world. We implemented a
 
 > For detailed setup instructions, see [docs/installation.md](docs/installation.md).
 
-## Documentation
+## License
 
-- [**System Architecture**](docs/architecture.md)
-- [**API Reference**](docs/api.md)
-- [**Usage Guide**](docs/usage.md)
-- [**Hackathon Logs**](docs/logs/)
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+---
+
+<p align="center">
+  Built with 🌵 <b>Cactus</b> and 🧠 <b>Google DeepMind</b>
+</p>
