@@ -15,7 +15,7 @@ graph TD
     
     subgraph "Python Backend (FastAPI)"
         Server[Server.py]
-        Router[Hybrid Router (src/main.py)]
+        Router["Hybrid Router (src/main.py)"]
         MCP[MCP Client Manager]
         
         Server --> Router
@@ -23,8 +23,8 @@ graph TD
         
         subgraph "Cactus Engine (Local)"
             FG[FunctionGemma]
-            Whisper[Whisper (Audio)]
-            VLM[LFM2-VL (Vision)]
+            Whisper["Whisper (Audio)"]
+            VLM["LFM2-VL (Vision)"]
         end
         
         subgraph "Cloud Services"
