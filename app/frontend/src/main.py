@@ -1,0 +1,1056 @@
+
+import sys
+sys.path.insert(0, "cactus/python/src")
+functiongemma_path = "cactus/weights/functiongemma-270m-it"
+
+import json, os, time, re, atexit
+from typing import Optional
+from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
+from google import genai
+from google.genai import types
+
+
+# ---------------------------------------------------------------------------
+# Environment & Config
+# ---------------------------------------------------------------------------
+
+def _load_env_file(file_path: str) -> dict:
+    env = {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip("\"").strip("'")
+    except FileNotFoundError:
+        return {}
+    return env
+
+
+def _get_gemini_api_key() -> Optional[str]:
+    # Prioritize local .env file over system environment variables
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    env = _load_env_file(env_path)
+    key = env.get("GEMINI_API_KEY")
+    if key:
+        return key.strip()
+    
+    # Fallback to system environment variable
+    key = os.environ.get("GEMINI_API_KEY")
+    return key.strip() if key else None
+
+
+_DIAG = True
+
+def _diag(*args):
+    if _DIAG:
+        print("    [diag]", *args, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Model caching – load once, reuse across all calls, destroy on exit
+# ---------------------------------------------------------------------------
+
+_cactus_model = None
+
+def _get_cactus_model():
+    global _cactus_model
+    if _cactus_model is None:
+        _cactus_model = cactus_init(functiongemma_path)
+        atexit.register(_cleanup_cactus_model)
+    return _cactus_model
+
+
+def _cleanup_cactus_model():
+    global _cactus_model
+    if _cactus_model is not None:
+        cactus_destroy(_cactus_model)
+        _cactus_model = None
+
+
+# ---------------------------------------------------------------------------
+# JSON repair — salvage malformed cactus responses (model-agnostic)
+# ---------------------------------------------------------------------------
+
+def _repair_and_parse(raw_str):
+    """Parse the cactus JSON response, repairing common model output quirks."""
+    try:
+        return json.loads(raw_str)
+    except json.JSONDecodeError:
+        pass
+
+    s = raw_str
+    s = s.replace('\uff1a', ':')
+    s = re.sub(r'<escape>', '', s)
+    s = re.sub(r'<start_function_\w+>', '', s)
+    s = re.sub(r'<end_function_\w+>', '', s)
+    s = re.sub(r':\s*([}\]])', r':""' + r'\1', s)
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    calls = []
+    for m in re.finditer(
+        r'"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*\{([^}]*)\}', s
+    ):
+        name, args_str = m.group(1), m.group(2)
+        args = {}
+        for am in re.finditer(r'"(\w+)"\s*:\s*(?:"([^"]*)"|([-\d.]+))', args_str):
+            key = am.group(1)
+            if am.group(2) is not None:
+                args[key] = am.group(2)
+            elif am.group(3) is not None:
+                try:
+                    v = am.group(3)
+                    args[key] = int(v) if '.' not in v else float(v)
+                except ValueError:
+                    args[key] = v
+        calls.append({"name": name, "arguments": args})
+
+    if calls:
+        time_m = re.search(r'"total_time_ms"\s*:\s*([\d.]+)', raw_str)
+        conf_m = re.search(r'"confidence"\s*:\s*([\d.]+)', raw_str)
+        return {
+            "function_calls": calls,
+            "total_time_ms": float(time_m.group(1)) if time_m else 0,
+            "confidence": float(conf_m.group(1)) if conf_m else 0.5,
+            "cloud_handoff": False,
+            "success": True,
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Post-processing helpers
+# ---------------------------------------------------------------------------
+
+def _coerce_argument_types(function_calls, tools):
+    """Cast argument values to match the declared schema types."""
+    tool_map = {t["name"]: t for t in tools}
+    for call in function_calls:
+        tool = tool_map.get(call.get("name"))
+        if not tool:
+            continue
+        props = tool["parameters"].get("properties", {})
+        args = call.get("arguments", {})
+        for key, value in list(args.items()):
+            schema = props.get(key)
+            if not schema:
+                continue
+
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+                args[key] = value
+
+            expected = schema.get("type", "").lower()
+            try:
+                if expected == "integer":
+                    if not isinstance(value, int):
+                        args[key] = int(float(str(value)))
+                    args[key] = abs(args[key])
+                elif expected == "number" and not isinstance(value, (int, float)):
+                    args[key] = float(str(value))
+                elif expected == "boolean" and not isinstance(value, bool):
+                    args[key] = str(value).lower() in ("true", "1", "yes")
+                elif expected == "string" and not isinstance(value, str):
+                    args[key] = str(value)
+            except (ValueError, TypeError):
+                pass
+
+
+def _is_valid_arg(val):
+    """Check if an argument value is present (handles 0 and False correctly)."""
+    if val is None:
+        return False
+    if isinstance(val, str) and val.strip() == "":
+        return False
+    return True
+
+
+def _filter_valid_calls(function_calls, tools):
+    """Keep only calls that reference real tools with all required args non-empty."""
+    tool_map = {t["name"]: t for t in tools}
+    valid = []
+    for call in function_calls:
+        name = call.get("name")
+        if name not in tool_map:
+            continue
+        required = tool_map[name]["parameters"].get("required", [])
+        args = call.get("arguments", {})
+        if all(r in args and _is_valid_arg(args[r]) for r in required):
+            valid.append(call)
+    return valid
+
+
+def _deduplicate_calls(function_calls):
+    """Remove exact-duplicate function calls."""
+    seen = set()
+    unique = []
+    for call in function_calls:
+        key = (call["name"], json.dumps(call.get("arguments", {}), sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            unique.append(call)
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# Argument-query overlap scoring — used to compare model vs schema results
+# ---------------------------------------------------------------------------
+
+def _arg_query_overlap(calls, user_text, tools=None, extra_nouns=None):
+    """Score how well argument values align with the query text."""
+    text_lower = user_text.lower()
+    tool_map = {t["name"]: t for t in tools} if tools else {}
+    nouns_lower = {n.lower() for n in extra_nouns} if extra_nouns else set()
+    score = 0
+    
+    for call in calls:
+        tool_name = call.get("name")
+        tool_name_words = set()
+        if tool_name:
+            for part in tool_name.split("_"):
+                tool_name_words.add(part.lower())
+
+        for val in call.get("arguments", {}).values():
+            if isinstance(val, int):
+                if val == 0:
+                    continue
+                score += 2 if str(val) in text_lower else -1
+            elif isinstance(val, str) and len(val) > 1:
+                val_lower = val.lower()
+                
+                # Check exact match in text OR in extra_nouns
+                if val_lower in text_lower:
+                     if val_lower in tool_name_words:
+                         continue
+                     score += 3
+                elif val_lower in nouns_lower:
+                     score += 3 # Match from context!
+                else:
+                    words = [w for w in val_lower.split() if len(w) >= 2]
+                    hits = 0
+                    for w in words:
+                        if (w in text_lower or w in nouns_lower) and w not in tool_name_words:
+                            hits += 1
+                    score += hits if hits > 0 else -1
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Schema-driven tool matching (general, works for any tool)
+# ---------------------------------------------------------------------------
+
+_STOP_WORDS = frozenset([
+    "a", "an", "the", "to", "for", "of", "in", "is", "and", "or",
+    "my", "me", "i", "it", "be", "at", "on", "with", "from", "by",
+    "do", "can", "you", "please", "some", "this", "that", "what", "how",
+    "which", "these", "should", "about", "up", "him", "her",
+])
+
+
+def _tokenize(text):
+    """Split text into cleaned lowercase tokens."""
+    result = []
+    for w in text.lower().split():
+        cleaned = w.strip('.,!?;:\'"()[]{}')
+        if cleaned and len(cleaned) >= 2:
+            result.append(cleaned)
+    return result
+
+
+def _words_similar(a, b):
+    """Prefix-based similarity: 'remind' matches 'reminder', etc."""
+    if a == b:
+        return True
+    if len(a) >= 3 and len(b) >= 3:
+        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        if longer.startswith(shorter):
+            return True
+    return False
+
+
+def _tool_relevance(tool, query_words):
+    """Score how relevant a tool is to the query using its full schema."""
+    tool_words = set()
+    for part in tool["name"].split("_"):
+        tool_words.add(part.lower())
+    for word in _tokenize(tool.get("description", "")):
+        tool_words.add(word)
+    for pname, pschema in tool["parameters"].get("properties", {}).items():
+        for part in pname.split("_"):
+            tool_words.add(part.lower())
+        for word in _tokenize(pschema.get("description", "")):
+            tool_words.add(word)
+    tool_words -= _STOP_WORDS
+    query_clean = query_words - _STOP_WORDS
+
+    # Expand query words with synonyms
+    expanded_query = set(query_clean)
+    _SYNONYMS = {
+        "text": "message",
+        "mail": "message",
+        "wake": "alarm",
+        "tune": "music",
+        "track": "music",
+        "song": "music",
+    }
+    for w in query_clean:
+        if w in _SYNONYMS:
+            expanded_query.add(_SYNONYMS[w])
+
+    matches = 0
+    for qw in expanded_query:
+        for tw in tool_words:
+            if _words_similar(qw, tw):
+                matches += 1
+                break
+
+    return matches / max(len(tool_words), 1)
+
+
+def _find_best_tool(user_text, tools):
+    """Pick the most relevant tool for the query using bag-of-words scoring."""
+    query_words = set(_tokenize(user_text))
+    best_tool = None
+    best_score = 0.0
+    for tool in tools:
+        score = _tool_relevance(tool, query_words)
+        if score > best_score:
+            best_score = score
+            best_tool = tool
+    return best_tool if best_score > 0.05 else None
+
+
+def _identify_tool_from_text(text, tools):
+    """Identify the intended tool from the model's natural-language response."""
+    text_lower = text.lower()
+    best_tool = None
+    best_count = 0
+    for tool in tools:
+        parts = tool["name"].split("_")
+        count = sum(1 for p in parts if p.lower() in text_lower)
+        if count > best_count:
+            best_count = count
+            best_tool = tool
+    return best_tool if best_count > 0 else None
+
+
+# ---------------------------------------------------------------------------
+# Proper noun extraction (reused across full query and split parts)
+# ---------------------------------------------------------------------------
+
+def _extract_proper_nouns(text, strip_set=None, schema_words=None):
+    """Extract capitalized words (proper nouns) from text, skipping index 0."""
+    nouns = []
+    words = text.split()
+    for i, w in enumerate(words):
+        cleaned = w.strip('.,!?;:\'"()[]{}')
+        if not cleaned or i == 0 or not cleaned[0].isupper():
+            continue
+        if cleaned.isdigit() or cleaned.upper() in ("AM", "PM"):
+            continue
+        if strip_set and schema_words and _should_strip(cleaned.lower(), strip_set, schema_words):
+            continue
+        nouns.append(cleaned)
+    return nouns
+
+
+# ---------------------------------------------------------------------------
+# Schema-driven argument extraction
+# ---------------------------------------------------------------------------
+
+def _build_strip_set(tool):
+    """Build a set of words to strip, using prefix matching against tool schema words."""
+    base = set(_STOP_WORDS)
+    schema_words = set()
+    for part in tool["name"].split("_"):
+        schema_words.add(part.lower())
+    for w in _tokenize(tool.get("description", "")):
+        schema_words.add(w)
+    for _pname, pschema in tool["parameters"].get("properties", {}).items():
+        for w in _tokenize(pschema.get("description", "")):
+            schema_words.add(w)
+    base |= schema_words
+    return base, schema_words
+
+
+def _should_strip(word_lower, strip_set, schema_words):
+    """Check if a word should be stripped — exact match OR prefix of a schema word."""
+    if word_lower in strip_set:
+        return True
+    if len(word_lower) >= 3:
+        for sw in schema_words:
+            if _words_similar(word_lower, sw):
+                return True
+    return False
+
+
+def _extract_from_schema(user_text, tool, extra_nouns=None):
+    """
+    Extract arguments from the query using the tool's parameter schema.
+    Uses general English patterns — not tool-specific.
+
+    extra_nouns: proper nouns from the parent query (for pronoun resolution
+                 in split sub-queries like "send him a message").
+    """
+    props = tool["parameters"]["properties"]
+    required = tool["parameters"].get("required", [])
+    strip_set, schema_words = _build_strip_set(tool)
+
+    words = user_text.split()
+    lower_text = user_text.lower()
+    args = {}
+
+    # --- Phase 1: Extract integers ---
+    numbers = []
+    for w in words:
+        cleaned = w.strip('.,!?;:')
+        if cleaned.isdigit():
+            numbers.append(int(cleaned))
+    for w in words:
+        cleaned = w.strip('.,!?;:')
+        if ":" in cleaned:
+            parts_c = cleaned.split(":")
+            if len(parts_c) == 2 and parts_c[0].isdigit() and parts_c[1].isdigit():
+                numbers.extend([int(parts_c[0]), int(parts_c[1])])
+
+    int_params = [(k, v) for k, v in props.items() if v.get("type") == "integer"]
+    for i, (pname, _pschema) in enumerate(int_params):
+        args[pname] = abs(numbers[i]) if i < len(numbers) else 0
+
+    # --- Phase 2: Extract proper nouns (capitalized words not at start) ---
+    local_nouns = _extract_proper_nouns(user_text, strip_set, schema_words)
+    all_nouns = list(local_nouns)
+    if extra_nouns:
+        existing = {pn.lower() for pn in all_nouns}
+        for en in extra_nouns:
+            if en.lower() not in existing:
+                all_nouns.append(en)
+
+    pn_used = set()
+
+    # --- Phase 3: Extract string params by description category ---
+    str_params = [(k, v) for k, v in props.items() if v.get("type") == "string"]
+    content_marker_pos = len(user_text)
+
+    for pname, pschema in str_params:
+        desc = (pschema.get("description", "") + " " + pname).lower()
+
+        # 3a. TIME params
+        if any(kw in desc for kw in ["time", "when", "schedule"]):
+            for prep in [" at "]:
+                idx = lower_text.find(prep)
+                if idx >= 0:
+                    after = user_text[idx + len(prep):]
+                    time_parts = []
+                    for tw in after.split():
+                        tw_clean = tw.strip('.,!?;:')
+                        if tw_clean and (tw_clean[0].isdigit() or tw_clean.upper() in ("AM", "PM")):
+                            time_parts.append(tw_clean)
+                        elif time_parts:
+                            break
+                    if time_parts:
+                        args[pname] = " ".join(time_parts)
+                        continue
+
+        # 3b. LOCATION params (before name to avoid "City name" ambiguity)
+        if any(kw in desc for kw in ["location", "city", "place"]):
+            for prep in [" in ", " at "]:
+                idx = lower_text.find(prep)
+                if idx >= 0:
+                    after = user_text[idx + len(prep):].strip()
+                    for end_marker in [" and ", ", ", " saying "]:
+                        end_idx = after.lower().find(end_marker)
+                        if end_idx >= 0:
+                            after = after[:end_idx]
+                    cleaned_loc = after.strip('.,!?;:')
+                    if cleaned_loc:
+                        args[pname] = cleaned_loc
+                        break
+            if pname in args:
+                continue
+
+        # 3c. NAME/ENTITY params: use proper nouns
+        # Only use extra_nouns (cross-query context) for person-type params
+        # to avoid contaminating non-person params like "Song name".
+        if any(kw in desc for kw in ["name", "person", "contact", "recipient"]):
+            is_person = any(kw in desc for kw in ["person", "contact", "recipient"])
+            nouns_pool = all_nouns if is_person else local_nouns
+            for pn in nouns_pool:
+                if pn not in pn_used:
+                    args[pname] = pn
+                    pn_used.add(pn)
+                    break
+            if pname in args:
+                continue
+
+        # 3d. CONTENT/MESSAGE params: text after "saying" / "that says"
+        if any(kw in desc for kw in ["content", "message", "text", "query"]):
+            for marker in [" saying ", " that says "]:
+                idx = lower_text.find(marker)
+                if idx >= 0:
+                    content_marker_pos = min(content_marker_pos, idx)
+                    after = user_text[idx + len(marker):].strip()
+                    for end_marker in [" and ", ", and "]:
+                        end_idx = after.lower().find(end_marker)
+                        if end_idx >= 0:
+                            after = after[:end_idx]
+                    cleaned_msg = after.strip('.,!?;:')
+                    if cleaned_msg:
+                        args[pname] = cleaned_msg
+                        break
+            if pname in args:
+                continue
+
+        # 3e. TITLE params: text after "about" or "to" (for tasks/reminders)
+        if any(kw in desc for kw in ["title", "subject", "topic"]):
+            for marker in [" about ", " to ", " called "]:
+                idx = lower_text.find(marker)
+                if idx >= 0:
+                    after = user_text[idx + len(marker):].strip()
+                    for end_marker in [" at ", " and ", ", "]:
+                        end_idx = after.lower().find(end_marker)
+                        if end_idx >= 0:
+                            after = after[:end_idx]
+                    for article in ["the ", "a ", "an "]:
+                        if after.lower().startswith(article):
+                            after = after[len(article):]
+                    cleaned_title = after.strip('.,!?;:')
+                    if cleaned_title:
+                        args[pname] = cleaned_title
+                        break
+            if pname in args:
+                continue
+        
+        # 3f. CHANNEL/MENTION params: words starting with # or @ (Slack specific but generic enough)
+        if any(kw in desc for kw in ["channel", "mention", "recipient"]):
+            for w in words:
+                cleaned = w.strip('.,!?;:')
+                if cleaned.startswith("#") or cleaned.startswith("@"):
+                     args[pname] = cleaned
+                     break
+            if pname in args:
+                continue
+
+    # --- Phase 4: Fill remaining unfilled string params with leftover text ---
+    # Only use words BEFORE any content marker ("saying", "that says") to avoid
+    # leaking message content into other params like recipient.
+    text_for_remaining = user_text[:content_marker_pos]
+    remaining = []
+    last_kept = False
+
+    for w in text_for_remaining.split():
+        cleaned = w.strip('.,!?;:\'"()[]{}').lower()
+        
+        should_strip = _should_strip(cleaned, strip_set, schema_words)
+        is_digit = cleaned.isdigit()
+        is_pn = cleaned in [pn.lower() for pn in pn_used]
+        is_time = cleaned.upper() in ("AM", "PM")
+        
+        keep = False
+        if cleaned and not is_digit and not is_pn and not is_time:
+            if not should_strip:
+                keep = True
+            elif last_kept:
+                # Heuristic: keep schema word if it extends a phrase (e.g. "classical music")
+                keep = True
+        
+        if keep:
+            raw = w.strip('.,!?;:')
+            if ":" in raw and all(p.isdigit() for p in raw.split(":")):
+                pass
+            else:
+                remaining.append(raw)
+            last_kept = True
+        else:
+            last_kept = False
+
+    remaining_text = " ".join(remaining).strip()
+    
+    # Params we should NEVER fill with "remaining text" because they require IDs/specifics
+    BLACKLIST_PARAMS = {"channel", "id", "url", "uri", "email", "phone", "uuid", "database_id", "block_id", "page_id"}
+
+    for pname, _pschema in str_params:
+        if pname not in args and remaining_text:
+            if pname.lower() in BLACKLIST_PARAMS:
+                continue
+            args[pname] = remaining_text
+            remaining_text = ""
+
+    if all(r in args and _is_valid_arg(args[r]) for r in required):
+        return {"name": tool["name"], "arguments": args}
+    return None
+
+
+def _best_extract_all_tools(user_text, tools, extra_nouns=None):
+    """
+    Try schema extraction for ALL available tools and pick the one whose
+    extracted arguments best match the query text (by overlap score).
+    """
+    best_call = None
+    best_score = 0
+    for t in tools:
+        ext = _extract_from_schema(user_text, t, extra_nouns=extra_nouns)
+        if ext:
+            _coerce_argument_types([ext], [t])
+            valid = _filter_valid_calls([ext], [t])
+            if valid:
+                score = _arg_query_overlap(valid, user_text, [t], extra_nouns=extra_nouns)
+                if score > best_score:
+                    best_score = score
+                    best_call = valid[0]
+    return best_call, best_score
+
+
+def _maybe_prefer_schema(calls, user_text, tools, extra_nouns=None):
+    """
+    For each model-returned call, also run schema extraction for the SAME tool
+    and pick whichever has better argument-query overlap. Zero-cost (no model call).
+    """
+    improved = []
+    for call in calls:
+        tool = next((t for t in tools if t["name"] == call["name"]), None)
+        if not tool:
+            improved.append(call)
+            continue
+        schema_alt = _extract_from_schema(user_text, tool, extra_nouns=extra_nouns)
+        if schema_alt:
+            _coerce_argument_types([schema_alt], [tool])
+            alt_valid = _filter_valid_calls([schema_alt], [tool])
+            if alt_valid:
+                m_score = _arg_query_overlap([call], user_text, tools, extra_nouns=extra_nouns)
+                s_score = _arg_query_overlap(alt_valid, user_text, [tool], extra_nouns=extra_nouns)
+                if s_score > m_score:
+                    _diag(f"schema-improve: {call['name']} model_score={m_score} schema_score={s_score}")
+                    improved.append(alt_valid[0])
+                    continue
+        improved.append(call)
+    return improved
+
+
+# ---------------------------------------------------------------------------
+# Cactus inference primitives
+# ---------------------------------------------------------------------------
+
+_SYS_PROMPT = (
+    "You are a helpful assistant that can use tools. "
+    "When the user asks for multiple things, call all the relevant tools. "
+    "Extract arguments from the user's request exactly as written."
+)
+
+
+def _post_process_args(function_calls):
+    """Clean up arguments based on heuristics."""
+    STRONG_GENRES = {
+        "jazz", "rock", "pop", "metal", "country", "rap", 
+        "blues", "soul", "funk", "disco", "techno", "house",
+        "lo-fi", "hip hop", "hip-hop"
+    }
+    for call in function_calls:
+        if call["name"] == "play_music":
+            song = call["arguments"].get("song")
+            if song and isinstance(song, str):
+                # Fix "jazz music" -> "jazz"
+                if song.lower().endswith(" music"):
+                    prefix = song[:-6].strip()
+                    if prefix.lower() in STRONG_GENRES:
+                        call["arguments"]["song"] = prefix
+    return function_calls
+
+
+def _cactus_attempt(model, messages, cactus_tools, **overrides):
+    """Run one cactus_complete call with JSON repair."""
+    raw_str = cactus_complete(
+        model,
+        messages,
+        tools=cactus_tools,
+        force_tools=True,
+        max_tokens=overrides.get("max_tokens", 512),
+        stop_sequences=["<|im_end|>", "<end_of_turn>"],
+        tool_rag_top_k=overrides.get("tool_rag_top_k", 0),
+        confidence_threshold=0.0,
+        temperature=overrides.get("temperature"),
+    )
+    return _repair_and_parse(raw_str)
+
+
+def _get_ms(raw):
+    return (raw or {}).get("total_time_ms", 0) or 0
+
+
+# ---------------------------------------------------------------------------
+# Generators
+# ---------------------------------------------------------------------------
+
+def generate_cactus(messages, tools, extra_nouns=None):
+    """
+    On-device function calling with multi-strategy fallback:
+
+    1. Standard function calling via cactus (fast path).
+       → Compare model's args against schema extract; pick the better match.
+    2. Schema-guided single-tool retry — if the model picked the wrong tool
+       or failed entirely, retry with only the schema-selected tool.
+    3. Schema-driven extraction — try target tool first; fall back to all-tools
+       only when the target was unreliably identified.
+    """
+    model = _get_cactus_model()
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
+    user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
+
+    # ---- Attempt 1: Standard function calling ----
+    cactus_reset(model)
+    raw1 = _cactus_attempt(
+        model,
+        [{"role": "system", "content": _SYS_PROMPT}] + messages,
+        cactus_tools,
+    )
+    total_ms = _get_ms(raw1)
+
+    calls1 = []
+    if raw1 and raw1.get("function_calls"):
+        fc = list(raw1["function_calls"])
+        _coerce_argument_types(fc, tools)
+        calls1 = _filter_valid_calls(fc, tools)
+
+    if calls1:
+        _diag(f"attempt1 OK: {json.dumps(calls1, ensure_ascii=False)}")
+    else:
+        resp = (raw1 or {}).get("response", "")
+        _diag(f"attempt1 FAIL: response={resp!r:.120}")
+
+    # Schema validation: only override when model's tool has ZERO query relevance
+    skip_model_calls = False
+    if calls1 and len(tools) > 1:
+        qwords = set(_tokenize(user_text))
+        schema_tool = _find_best_tool(user_text, tools)
+        if schema_tool and calls1[0]["name"] != schema_tool["name"]:
+            model_t = next((t for t in tools if t["name"] == calls1[0]["name"]), None)
+            m_rel = _tool_relevance(model_t, qwords) if model_t else 0
+            s_rel = _tool_relevance(schema_tool, qwords)
+            if m_rel < 0.01 and s_rel > 0.15:
+                skip_model_calls = True
+                _diag(f"schema OVERRIDE: model={calls1[0]['name']} schema={schema_tool['name']} (m_rel={m_rel:.2f} s_rel={s_rel:.2f})")
+
+    if calls1 and not skip_model_calls:
+        calls1 = _maybe_prefer_schema(calls1, user_text, tools, extra_nouns=extra_nouns)
+        return {
+            "function_calls": _post_process_args(calls1),
+            "total_time_ms": total_ms,
+            "confidence": float(raw1.get("confidence", 0) or 0),
+            "cloud_handoff": False,
+        }
+
+    # ---- Find the best target tool for retry ----
+    target = _find_best_tool(user_text, tools)
+    target_reliable = target is not None
+    if not target:
+        model_text = (raw1 or {}).get("response", "") or ""
+        target = _identify_tool_from_text(model_text, tools)
+    if not target and len(tools) == 1:
+        target = tools[0]
+        target_reliable = True
+    _diag(f"target tool for retry: {target['name'] if target else 'NONE'} (reliable={target_reliable})")
+
+    # ---- Attempt 2: Single-tool retry (schema-guided) ----
+    if target:
+        single = [{"type": "function", "function": target}]
+        cactus_reset(model)
+        raw2 = _cactus_attempt(model, messages, single, temperature=0)
+        total_ms += _get_ms(raw2)
+
+        if raw2 and raw2.get("function_calls"):
+            fc = list(raw2["function_calls"])
+            _coerce_argument_types(fc, [target])
+            calls2 = _filter_valid_calls(fc, [target])
+            if calls2:
+                calls2 = _maybe_prefer_schema(calls2, user_text, [target], extra_nouns=extra_nouns)
+                _diag(f"attempt2 OK: {json.dumps(calls2, ensure_ascii=False)}")
+                return {
+                    "function_calls": _post_process_args(calls2),
+                    "total_time_ms": total_ms,
+                    "confidence": float(raw2.get("confidence", 0) or 0),
+                    "cloud_handoff": False,
+                }
+
+        resp2 = (raw2 or {}).get("response", "")
+        _diag(f"attempt2 FAIL: response={resp2!r:.120}")
+
+    # ---- Attempt 3: Schema-driven extraction ----
+    # 3a: Try the identified target tool first
+    target_call = None
+    if target:
+        ext = _extract_from_schema(user_text, target, extra_nouns=extra_nouns)
+        if ext:
+            _coerce_argument_types([ext], [target])
+            valid = _filter_valid_calls([ext], [target])
+            if valid:
+                target_call = valid[0]
+
+    # 3b: If target is reliable, trust it
+    if target_call and target_reliable:
+        _diag(f"attempt3 (target extract) OK: {json.dumps([target_call], ensure_ascii=False)}")
+        return {
+            "function_calls": _post_process_args([target_call]),
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+
+    # 3c: Target unreliable or failed — try all tools and compare
+    best_all, best_all_score = _best_extract_all_tools(user_text, tools, extra_nouns=extra_nouns)
+    if target_call and best_all:
+        target_score = _arg_query_overlap([target_call], user_text, tools, extra_nouns=extra_nouns)
+        if best_all_score > target_score:
+            _diag(f"attempt3 (all-tools) OK: {json.dumps([best_all], ensure_ascii=False)} score={best_all_score} > target={target_score}")
+            return {
+                "function_calls": _post_process_args([best_all]),
+                "total_time_ms": total_ms,
+                "confidence": 0.5,
+                "cloud_handoff": False,
+            }
+        _diag(f"attempt3 (target wins) OK: {json.dumps([target_call], ensure_ascii=False)} score={target_score}")
+        return {
+            "function_calls": _post_process_args([target_call]),
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+    if best_all and best_all_score > 0:
+        _diag(f"attempt3 (all-tools) OK: {json.dumps([best_all], ensure_ascii=False)} score={best_all_score}")
+        return {
+            "function_calls": _post_process_args([best_all]),
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+    if target_call:
+        _diag(f"attempt3 (target extract) OK: {json.dumps([target_call], ensure_ascii=False)}")
+        return {
+            "function_calls": _post_process_args([target_call]),
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+    _diag("attempt3 FAIL")
+
+    _diag("ALL LOCAL ATTEMPTS FAILED")
+    return {
+        "function_calls": [],
+        "total_time_ms": total_ms,
+        "confidence": 0,
+        "cloud_handoff": True,
+    }
+
+
+def _json_schema_to_gemini(schema):
+    schema_type = schema.get("type", "STRING").upper()
+    description = schema.get("description", "")
+    
+    if schema_type == "OBJECT":
+        properties = {}
+        required = schema.get("required", [])
+        for k, v in schema.get("properties", {}).items():
+            properties[k] = _json_schema_to_gemini(v)
+        return types.Schema(
+            type=types.Type.OBJECT, 
+            description=description, 
+            properties=properties, 
+            required=required
+        )
+    
+    elif schema_type == "ARRAY":
+        items = schema.get("items")
+        if items:
+            return types.Schema(
+                type=types.Type.ARRAY, 
+                description=description, 
+                items=_json_schema_to_gemini(items)
+            )
+        return types.Schema(type=types.Type.ARRAY, description=description)
+        
+    else:
+        # Map simple types
+        type_map = {
+            "STRING": types.Type.STRING,
+            "INTEGER": types.Type.INTEGER,
+            "NUMBER": types.Type.NUMBER,
+            "BOOLEAN": types.Type.BOOLEAN,
+        }
+        return types.Schema(type=type_map.get(schema_type, types.Type.STRING), description=description)
+
+
+def generate_cloud(messages, tools):
+    """Run function calling via Gemini Cloud API."""
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+
+    gemini_tools = [
+        types.Tool(function_declarations=[
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters=_json_schema_to_gemini(t["parameters"])
+            )
+            for t in tools
+        ])
+    ]
+
+    contents = [m["content"] for m in messages if m["role"] == "user"]
+
+    start_time = time.time()
+
+    gemini_response = client.models.generate_content(
+        model="gemini-3.0-flash",
+        contents=contents,
+        config=types.GenerateContentConfig(tools=gemini_tools),
+    )
+
+    total_time_ms = (time.time() - start_time) * 1000
+
+    function_calls = []
+    text_response = ""
+    if gemini_response.candidates:
+        for candidate in gemini_response.candidates:
+            if candidate.content and candidate.content.parts:
+                for part in candidate.content.parts:
+                    if part.function_call:
+                        function_calls.append({
+                            "name": part.function_call.name,
+                            "arguments": dict(part.function_call.args),
+                        })
+                    if part.text:
+                        text_response += part.text
+
+    return {
+        "function_calls": _post_process_args(function_calls),
+        "response": text_response,
+        "total_time_ms": total_time_ms,
+    }
+
+
+def generate_hybrid(messages, tools, confidence_threshold=0.7):
+    """
+    Smart heuristic router for edge-cloud inference.
+
+    Pipeline:
+        1. Run local model with multi-strategy fallback (generate_cactus).
+        2. If the query has multiple intents (conjunctions) and the model
+           returned fewer calls than expected, split and run each part
+           through the full local pipeline, then MERGE results.
+           Proper nouns from the full query are forwarded to split parts
+           for pronoun resolution (e.g. "him" → "Tom").
+        3. Cloud fallback only when all local attempts produce nothing.
+    """
+    user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
+    local = generate_cactus(messages, tools)
+
+    model_calls = _filter_valid_calls(local["function_calls"], tools)
+    model_calls = _deduplicate_calls(model_calls)
+
+    parts = re.split(r'\s+and\s+|,\s*and\s+|,\s+', user_text)
+    parts = [p.strip() for p in parts if len(p.strip()) > 5]
+    expected_count = max(1, len(parts))
+
+    total_ms = local["total_time_ms"]
+
+    if len(parts) > 1 and len(model_calls) < expected_count:
+        full_nouns = _extract_proper_nouns(user_text)
+        _diag(f"SPLIT: {len(parts)} parts, model has {len(model_calls)}/{expected_count} calls, context_nouns={full_nouns}")
+        split_calls = []
+        for part in parts:
+            _diag(f"  split part: {part!r}")
+            sub = generate_cactus(
+                [{"role": "user", "content": part}], tools,
+                extra_nouns=full_nouns,
+            )
+            sub_calls = _filter_valid_calls(sub["function_calls"], tools)
+            split_calls.extend(sub_calls)
+            total_ms += sub["total_time_ms"]
+        split_calls = _deduplicate_calls(split_calls)
+
+        merged = list(split_calls)
+        existing_tools = {c["name"] for c in merged}
+        for mc in model_calls:
+            if mc["name"] not in existing_tools:
+                merged.append(mc)
+                existing_tools.add(mc["name"])
+        merged = _deduplicate_calls(merged)
+
+        _diag(f"SPLIT result (merged): {json.dumps(merged, ensure_ascii=False)}")
+        if len(merged) > len(model_calls):
+            model_calls = merged
+
+    if model_calls:
+        return {
+            "function_calls": model_calls,
+            "total_time_ms": total_ms,
+            "confidence": local.get("confidence", 0),
+            "source": "on-device",
+        }
+
+    # --- Cloud fallback ---
+    cloud = generate_cloud(messages, tools)
+    cloud["source"] = "cloud (fallback)"
+    cloud["local_confidence"] = local.get("confidence", 0)
+    cloud["total_time_ms"] += total_ms
+    return cloud
+
+
+def print_result(label, result):
+    """Pretty-print a generation result."""
+    print(f"\n=== {label} ===\n")
+    if "source" in result:
+        print(f"Source: {result['source']}")
+    if "confidence" in result:
+        print(f"Confidence: {result['confidence']:.4f}")
+    if "local_confidence" in result:
+        print(f"Local confidence (below threshold): {result['local_confidence']:.4f}")
+    print(f"Total time: {result['total_time_ms']:.2f}ms")
+    
+    if result.get("response"):
+        print(f"Response: {result['response']}")
+        
+    for call in result["function_calls"]:
+        print(f"Function: {call['name']}")
+        print(f"Arguments: {json.dumps(call['arguments'], indent=2)}")
+
+
+############## Example usage ##############
+
+if __name__ == "__main__":
+    tools = [{
+        "name": "get_weather",
+        "description": "Get current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "City name",
+                }
+            },
+            "required": ["location"],
+        },
+    }]
+
+    messages = [
+        {"role": "user", "content": "What is the weather in San Francisco?"}
+    ]
+
+    on_device = generate_cactus(messages, tools)
+    print_result("FunctionGemma (On-Device Cactus)", on_device)
+
+    cloud = generate_cloud(messages, tools)
+    print_result("Gemini (Cloud)", cloud)
+
+    hybrid = generate_hybrid(messages, tools)
+    print_result("Hybrid (On-Device + Cloud Fallback)", hybrid)

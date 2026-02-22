@@ -1,0 +1,441 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Nova</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 15px;
+            background-color: rgba(20, 20, 20, 0.95); /* Darker, less transparent for readability */
+            color: #eee;
+            border-radius: 12px;
+            overflow: hidden;
+            -webkit-app-region: drag; /* Allow dragging */
+            display: flex;
+            flex-direction: column;
+            height: 95vh;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 10px;
+        }
+        h1 {
+            font-size: 16px;
+            margin: 0;
+            font-weight: 600;
+        }
+        .status {
+            font-size: 10px;
+            color: #aaa;
+        }
+        .status.connected { color: #4caf50; }
+        .status.disconnected { color: #f44336; }
+
+        /* Chat Area */
+        #chat-container {
+            flex: 1;
+            overflow-y: auto;
+            margin-bottom: 10px;
+            padding-right: 5px;
+            -webkit-app-region: no-drag; /* Allow scrolling */
+        }
+        .message {
+            margin-bottom: 8px;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            line-height: 1.4;
+            max-width: 90%;
+            word-wrap: break-word;
+            display: flex;
+            flex-direction: column;
+        }
+        .message.user {
+            background-color: #007aff;
+            color: white;
+            align-self: flex-end;
+            margin-left: auto;
+        }
+        .message.ai {
+            background-color: #333;
+            color: #ddd;
+            align-self: flex-start;
+        }
+        .message.system {
+            background-color: transparent;
+            color: #888;
+            font-style: italic;
+            font-size: 11px;
+            text-align: center;
+            width: 100%;
+        }
+        
+        .metadata {
+            font-size: 9px;
+            color: #777;
+            margin-top: 4px;
+            padding-top: 4px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .metadata span {
+            display: inline-block;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            gap: 5px;
+            -webkit-app-region: no-drag;
+        }
+        input {
+            flex: 1;
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background-color: #222;
+            color: white;
+            outline: none;
+        }
+        input:focus {
+            border-color: #007aff;
+        }
+        button {
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.2s;
+        }
+        .btn-primary {
+            background-color: #007aff;
+            color: white;
+        }
+        .btn-primary:hover { background-color: #006ae6; }
+        
+        .btn-secondary {
+            background-color: #444;
+            color: #eee;
+        }
+        .btn-secondary:hover { background-color: #555; }
+        
+        .btn-record {
+            background-color: #ff3b30;
+            color: white;
+            width: 36px; /* Circle */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .btn-record.recording {
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Nova</h1>
+        <span id="status" class="status disconnected">● Connecting...</span>
+    </header>
+
+    <div id="chat-container">
+        <!-- Messages go here -->
+    </div>
+    
+    <div class="controls">
+        <button id="btn-record" class="btn-secondary btn-record" title="Hold to Speak">🎤</button>
+        <button id="btn-screen" class="btn-secondary" title="Analyze Screen">👁️</button>
+        <input type="text" id="prompt" placeholder="Ask anything..." />
+        <button id="btn-send" class="btn-primary">Send</button>
+    </div>
+
+    <script>
+        const { ipcRenderer, desktopCapturer } = require('electron');
+        
+        const chatContainer = document.getElementById('chat-container');
+        const promptInput = document.getElementById('prompt');
+        const statusSpan = document.getElementById('status');
+        const btnRecord = document.getElementById('btn-record');
+        const btnScreen = document.getElementById('btn-screen');
+        const btnSend = document.getElementById('btn-send');
+
+        let isRecording = false;
+        let mediaRecorder;
+        let audioChunks = [];
+
+        // --- UI Helpers ---
+        function addMessage(text, type, metadata = null) {
+            const div = document.createElement('div');
+            div.className = `message ${type}`;
+            
+            // Text content
+            const contentDiv = document.createElement('div');
+            contentDiv.textContent = text;
+            div.appendChild(contentDiv);
+
+            // Metadata footer (only for AI messages usually)
+            if (metadata && type === 'ai') {
+                const metaDiv = document.createElement('div');
+                metaDiv.className = 'metadata';
+                
+                if (metadata.source) {
+                    const span = document.createElement('span');
+                    span.textContent = `Source: ${metadata.source}`;
+                    metaDiv.appendChild(span);
+                }
+                
+                if (metadata.confidence !== undefined) {
+                    const span = document.createElement('span');
+                    span.textContent = `Conf: ${metadata.confidence.toFixed(2)}`;
+                    metaDiv.appendChild(span);
+                }
+                
+                if (metadata.time) {
+                    const span = document.createElement('span');
+                    span.textContent = `${metadata.time.toFixed(0)}ms`;
+                    metaDiv.appendChild(span);
+                }
+
+                // Available tools display
+                if (metadata.available_tools && metadata.available_tools.length > 0) {
+                    const toolsDiv = document.createElement('div');
+                    toolsDiv.style.marginTop = '4px';
+                    toolsDiv.style.fontSize = '10px';
+                    toolsDiv.style.color = '#aaa';
+                    toolsDiv.textContent = `Tools Available: ${metadata.available_tools.join(', ')}`;
+                    metaDiv.appendChild(toolsDiv);
+                }
+                
+                div.appendChild(metaDiv);
+            }
+
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function setStatus(connected) {
+            statusSpan.className = `status ${connected ? 'connected' : 'disconnected'}`;
+            statusSpan.textContent = connected ? '● Online' : '● Offline';
+        }
+
+        // --- Backend Communication ---
+        async function sendQuery() {
+            const text = promptInput.value.trim();
+            if (!text) return;
+
+            addMessage(text, 'user');
+            promptInput.value = '';
+
+            try {
+                const response = await fetch('http://127.0.0.1:8000/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        messages: [{role: "user", content: text}],
+                        tools: [] 
+                    })
+                });
+                
+                const data = await response.json();
+                
+                let messageText = "";
+                if (data.response) {
+                    messageText = data.response;
+                }
+                
+                // Explicitly show tool sequence if present
+                if (data.function_calls && data.function_calls.length > 0) {
+                     const toolCalls = data.function_calls.map(fc => `🔨 ${fc.name}(${JSON.stringify(fc.arguments)})`).join('\n');
+                     if (messageText) {
+                         messageText += '\n\n' + toolCalls;
+                     } else {
+                         messageText = toolCalls;
+                     }
+                } else if (data.execution_results && data.execution_results.length > 0) {
+                     const execResults = data.execution_results.map(er => `✅ ${er.function_name}: ${JSON.stringify(er.result)}`).join('\n');
+                     if (messageText) {
+                         messageText += '\n\n' + execResults;
+                     } else {
+                         messageText = execResults;
+                     }
+                }
+                
+                if (!messageText) {
+                    // Fallback to raw JSON if we really can't find anything, but format it slightly better
+                    messageText = "No text response generated.";
+                }
+
+                addMessage(messageText, 'ai', {
+                    source: data.source,
+                    confidence: data.confidence,
+                    time: data.total_time_ms,
+                    available_tools: data.available_tools // Pass available tools to metadata
+                });
+                
+            } catch (err) {
+                addMessage("Error: " + err.message, 'system');
+            }
+        }
+
+        // --- Audio Recording ---
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    await sendAudio(audioBlob);
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                btnRecord.classList.add('recording');
+            } catch (err) {
+                console.error("Mic error:", err);
+                addMessage("Mic Error: " + err.message, 'system');
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                btnRecord.classList.remove('recording');
+            }
+        }
+
+        async function sendAudio(blob) {
+            addMessage("Transcribing audio...", 'system');
+            const formData = new FormData();
+            formData.append('file', blob, 'recording.wav');
+
+            try {
+                const response = await fetch('http://127.0.0.1:8000/transcribe', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.text) {
+                    addMessage("You said: " + data.text, 'user');
+                    // Automatically send as query? Optional. Let's populate input instead.
+                    promptInput.value = data.text;
+                }
+            } catch (err) {
+                addMessage("Transcription failed: " + err.message, 'system');
+            }
+        }
+
+        // --- Screen Capture ---
+        async function captureScreen() {
+            addMessage("Capturing screen...", 'system');
+            try {
+                // Get sources
+                const sources = await desktopCapturer.getSources({ types: ['screen'] });
+                // Pick the first screen
+                const source = sources[0]; 
+                
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: false,
+                    video: {
+                        mandatory: {
+                            chromeMediaSource: 'desktop',
+                            chromeMediaSourceId: source.id,
+                            minWidth: 1280,
+                            maxWidth: 1920,
+                            minHeight: 720,
+                            maxHeight: 1080
+                        }
+                    }
+                });
+
+                // Grab a frame
+                const track = stream.getVideoTracks()[0];
+                const imageCapture = new ImageCapture(track);
+                const bitmap = await imageCapture.grabFrame();
+                
+                // Convert to Blob
+                const canvas = document.createElement('canvas');
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+                const context = canvas.getContext('2d');
+                context.drawImage(bitmap, 0, 0);
+                
+                canvas.toBlob(async (blob) => {
+                    await sendScreen(blob);
+                    // Stop stream
+                    track.stop();
+                }, 'image/png');
+
+            } catch (err) {
+                console.error("Screen capture error:", err);
+                addMessage("Screen capture failed: " + err.message, 'system');
+            }
+        }
+
+        async function sendScreen(blob) {
+            addMessage("Analyzing screen...", 'system');
+            const formData = new FormData();
+            formData.append('file', blob, 'screen.png');
+
+            try {
+                const response = await fetch('http://127.0.0.1:8000/analyze-screen', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                addMessage("Screen Context: " + data.description, 'system');
+            } catch (err) {
+                addMessage("Analysis failed: " + err.message, 'system');
+            }
+        }
+
+        // --- Event Listeners ---
+        btnSend.addEventListener('click', sendQuery);
+        promptInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendQuery();
+        });
+
+        // Toggle recording on click for simplicity (or hold)
+        btnRecord.addEventListener('mousedown', startRecording);
+        btnRecord.addEventListener('mouseup', stopRecording);
+        btnRecord.addEventListener('mouseleave', stopRecording);
+
+        btnScreen.addEventListener('click', captureScreen);
+
+        // Check backend health
+        setInterval(async () => {
+            try {
+                await fetch('http://127.0.0.1:8000/health');
+                setStatus(true);
+            } catch (e) {
+                setStatus(false);
+            }
+        }, 2000);
+    </script>
+</body>
+</html>

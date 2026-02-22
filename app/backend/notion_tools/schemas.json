@@ -1,0 +1,68 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "notion_search",
+      "description": "Search the Notion workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string"},
+          "page_size": {"type": "integer", "minimum": 1, "maximum": 100}
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "notion_get_page",
+      "description": "Retrieve a Notion page by id.",
+      "parameters": {
+        "type": "object",
+        "properties": {"page_id": {"type": "string"}},
+        "required": ["page_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "notion_create_page",
+      "description": "Create a page in a database.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "database_id": {"type": "string"},
+          "properties": {"type": "object"},
+          "children": {"type": "array"}
+        },
+        "required": ["database_id", "properties"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "notion_update_page",
+      "description": "Update properties on a page.",
+      "parameters": {
+        "type": "object",
+        "properties": {"page_id": {"type": "string"}, "properties": {"type": "object"}},
+        "required": ["page_id", "properties"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "notion_append_block",
+      "description": "Append child blocks to a block or page.",
+      "parameters": {
+        "type": "object",
+        "properties": {"block_id": {"type": "string"}, "children": {"type": "array"}},
+        "required": ["block_id", "children"]
+      }
+    }
+  }
+]
