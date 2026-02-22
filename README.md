@@ -1,17 +1,5 @@
 # Nova - Hybrid AI Desktop Assistant
 
-<div align="center">
-  <img src="assets/banner.png" alt="Nova Banner" width="100%" style="border-radius: 10px;">
-  
-  <p align="center">
-    <b>Hybrid AI Intelligence • Invisible Interface • On-Device First</b>
-  </p>
-
-  <p align="center">
-    Built for the <b>Cactus x Google DeepMind Hackathon</b>
-  </p>
-</div>
-
 **Nova** is an intelligent, privacy-preserving desktop assistant that leverages hybrid AI to enhance your workflow. By combining the speed and privacy of on-device inference (**Cactus + FunctionGemma**) with the reasoning capabilities of the cloud (**Gemini**), Nova provides real-time assistance without compromising user data.
 
 ## Features
